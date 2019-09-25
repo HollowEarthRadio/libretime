@@ -176,12 +176,37 @@ server.register(namespace="dynamic_source",
 #                "read_stop_all",
 #                fun (s) -> begin log("dynamic_source.read_stop") destroy_dynamic_source_all() end)
 
-default = amplify(id="silence_src", 0.00001, noise())
+# backup stream for when there is no live DJ or scheduled Airtime playlist
+def get_safe_song()
+  uri = list.hd(get_process_lines("python /usr/local/lib/python2.7/dist-packages/airtime_playout-1.0-py2.7.egg/liquidsoap/FCC_safe_song.py"))
+  request.create(uri)
+end
+
+backupPlaylist = request.dynamic(get_safe_song)
+
+# stationId stream at top of hour and half past
+def get_station_id()
+  uri = list.hd(get_process_lines("python /usr/local/lib/python2.7/dist-packages/airtime_playout-1.0-py2.7.egg/liquidsoap/voice_station_id.py"))
+  request.create(uri)
+end
+
+stationId = request.dynamic(get_station_id)
+
+# mixed backup playlist and station id together
+backupStream = smooth_add(delay=0.3,p=0.1,normal=backupPlaylist,special=switch([({ 0m15s or 30m15s }, stationId)]))
+
+# set default stream to backup stream
+default = fallback(track_sensitive = false, [ backupStream ])
+
+# old, stock airtime default stream
+#default = amplify(id="silence_src", 0.00001, noise())
 ref_off_air_meta = ref off_air_meta
 if !ref_off_air_meta == "" then
     ref_off_air_meta := "LibreTime - offline"
 end
-default = rewrite_metadata([("title", !ref_off_air_meta)], default)
+
+#default = rewrite_metadata([("title", !ref_off_air_meta)], default)
+
 ignore(output.dummy(default, fallible=true))
 
 master_dj_enabled = ref false
@@ -190,18 +215,22 @@ scheduled_play_enabled = ref false
 
 def make_master_dj_available()
     master_dj_enabled := true
+    ignore(server.execute("dump.start"))
 end
 
 def make_master_dj_unavailable()
     master_dj_enabled := false
+    ignore(server.execute("dump.stop"))
 end
 
 def make_live_dj_available()
     live_dj_enabled := true
+    ignore(server.execute("dump.start"))
 end
 
 def make_live_dj_unavailable()
     live_dj_enabled := false
+    ignore(server.execute("dump.stop"))
 end
 
 def make_scheduled_play_available()
@@ -387,6 +416,57 @@ if output_sound_device then
 	end
 
 end
+
+###
+### Modifications to archive the live master_dj stream
+###
+
+stop_master_dump_fn = ref (fun () -> ())
+
+def rewrite_master_dump_metadata(filename, show_title, start_time) =
+  ignore(system("id3v2 --delete-all \"#{filename}\""))
+  ignore(system("id3v2 --artist \"#{show_title}\" \"#{filename}\""))
+  ignore(system("id3v2 --album \"Live on Hollow Earth Radio\" \"#{filename}\""))
+  ignore(system("id3v2 --song \"#{start_time}\" \"#{filename}\""))
+  ignore(system("id3v2 --genre \"ShowArchive\" \"#{filename}\""))
+end
+
+def start_master_dump()
+  show_title = list.hd(get_process_lines("python /usr/local/lib/python2.7/dist-packages/airtime_playout-1.0-py2.7.egg/liquidsoap/get_current_show.py"))
+  current_time = list.hd(get_process_lines("date +%c"))
+
+  dump = output.file(
+        fallible=true,
+        %mp3.vbr(stereo=true,samplerate=44100,quality=2,id3v2=true),
+        on_start={log("!!!!!!!!! Starting dump of master stream")},
+        on_stop={log("!!!!!!!!!! Stopping dump of master stream")},
+        on_close=fun(filename)->rewrite_master_dump_metadata(filename, show_title, current_time),
+        "/srv/hollowearth/library/#{show_title}/%Y-%m-%d-%H_%M_%S.mp3",
+        s)
+
+  stop_master_dump_fn := fun() -> source.shutdown(dump)
+end
+
+def stop_master_dump()
+    f = !stop_master_dump_fn
+    f ()
+end
+
+server.register(namespace="dump",
+    description="Start master dump.",
+    usage="dump.start",
+    "start",
+    fun (s) -> begin start_master_dump() "Done." end)
+
+server.register(namespace="dump",
+    description="Stop master dump",
+    usage="dump.stop",
+    "stop",
+    fun (s) -> begin stop_master_dump() "Done." end)
+
+###
+### End of modifications for archiving master_dj
+###
 
 if s1_enable == true then
     if s1_output == 'shoutcast' then
